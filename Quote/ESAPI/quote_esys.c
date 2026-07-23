@@ -8,6 +8,43 @@
 
 //#include <tss2/tss2_mu.h>
 
+static char *data_read(const char *path, size_t *out_size) {
+    FILE *fp = fopen(path, "rb");
+    char *buf;
+    long sz;
+
+    if(!fp){
+        perror("fopen");
+        exit(1);
+    }
+    if(fseek(fp, 0, SEEK_END) != 0){
+        fclose(fp);
+        exit(1);
+    }
+    sz = ftell(fp);
+    if(sz < 0){
+        fclose(fp);
+        exit(1);
+    }
+    rewind(fp);
+
+    buf = malloc((size_t)sz);
+
+    if(!buf){
+        fclose(fp);
+        exit(1);
+    }
+
+    if(fread(buf, 1, (size_t)sz, fp) != (size_t)sz){
+        free(buf);
+        fclose(fp);
+        exit(1);
+    }
+    fclose(fp);
+    *out_size = (size_t)sz;
+    return buf;
+}
+
 static void ctx_finalize(TSS2_TCTI_CONTEXT *tcti, ESYS_CONTEXT *esys){
     if(esys){
         Esys_Finalize(&esys);
@@ -244,9 +281,9 @@ int main(void){
     Select_PCR.count = 1;
     Select_PCR.pcrSelections -> hash = TPM2_ALG_SHA256;
     Select_PCR.pcrSelections -> sizeofSelect = 3;
-    //Select_PCR.pcrSelections -> pcrSelect[0] = ;
-    Select_PCR.pcrSelections -> pcrSelect[1] = 1 << 2;
-    Select_PCR.pcrSelections -> pcrSelect[2] = 1;
+    Select_PCR.pcrSelections -> pcrSelect[0] = 0xFE;
+    Select_PCR.pcrSelections -> pcrSelect[1] = 0x03;
+    Select_PCR.pcrSelections -> pcrSelect[2] = 0x00;
 
     rc = Esys_Quote(
             es_ctx,
@@ -261,6 +298,16 @@ int main(void){
     rc_check(rc, t_ctx, es_ctx);
     printf("quote OK\n");
 
+	size_t check_size = quote->size;
+/*	
+	FILE *fp = fopen("quote.bin", "wb");
+	fwrite(quote->attestationData, 1, quote->size, fp);
+	fclose(fp);
+*/
+	char *message = data_read("quote.bin", &check_size);
+	if(memcmp(quote->attestationData, message, quote->size))printf("quote check OK\n");
+
+
     TPM2B_MAX_BUFFER data;
     data.size = quote->size;
     memcpy(data.buffer, quote->attestationData, quote->size);
@@ -273,13 +320,13 @@ int main(void){
         ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
         &data,
         TPM2_ALG_SHA256,
-        //ESYS_TR_RH_OWNER,
         ESYS_TR_RH_NULL,
         &digest,
         &validation
     );
     rc_check(rc, t_ctx, es_ctx);
     printf("hash OK\n");
+
 
     TPMT_TK_VERIFIED *valid;
 

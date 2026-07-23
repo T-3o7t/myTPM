@@ -82,12 +82,18 @@ int main(int argc, char *argv[])
 			"34bd807d04c406942d2ad129a3b1cbf989f9f7a8b9c010da70a4c781de633279", //EventNum9  Digest
 			"3d6772b4f84ed47595d72a2c4c5ffd15f5bb72c7507fe26f2aaee2c69d5633ba", //EventNum13 Digest
 			"df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119", //EventNum20 Digest
-			"3319f2a64873c0e7e0da3aadb1d8d3add1558be2d99d89c3d8a048986cdbfff7"  //EventNum23 Digest
+//			"3319f2a64873c0e7e0da3aadb1d8d3add1558be2d99d89c3d8a048986cdbfff7"  //EventNum23 Digest
+			argv[1]
 			};
+
+	if (argc != 2) {
+        fprintf(stderr, "使い方: %s 'PE_IMAGE_HASH'\n", argv[0]);
+        return 1;
+    }
     /* PCRの初期値は0で初期化 (TPMのリセット直後の状態を想定) */
     unsigned char pcr[PCR_SIZE] = {0};
     unsigned char values[4][PCR_SIZE];
-    const char *labels[4] = {"A", "B", "C", "D"};
+    const char *labels[4] = {"EventNum 9", "EventNum 13", "EventNum 20", "EventNum 23"};
 
     /* 入力された4つの16進文字列をバイト列に変換 */
     for (int i = 0; i < 4; i++) {
@@ -102,7 +108,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    printf("初期PCR値       : ");
+    printf("PCR[4]       : ");
     print_hex(pcr, PCR_SIZE);
 
     /* A, B, C, D の順に extend を実行 */
@@ -112,7 +118,7 @@ int main(int argc, char *argv[])
         print_hex(pcr, PCR_SIZE);
     }
 
-    printf("\n最終PCR値        : ");
+    printf("\nPCR[4]        : ");
     print_hex(pcr, PCR_SIZE);
 
     return 0;
