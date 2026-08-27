@@ -7,19 +7,21 @@
 #include <tss2/tss2_common.h>
 #include <tss2/tss2_mu.h>
 
-static void ctx_finalize(TSS2_TCTI_CONTEXT *tcti, ESYS_CONTEXT *esys){
-    if (esys){
-        Esys_Finalize(&esys);
-        free(esys);
+/* tcti/esys は呼び出し元の変数そのもの(ダブルポインタ)を受け取り、
+ * Finalize後に呼び出し元のポインタもNULLへ戻す。値渡しだと
+ * ここでNULL化されるのはローカルコピーだけになり、呼び出し元には
+ * 解放済みポインタが残ってしまう(ダングリングポインタ)。 */
+static void ctx_finalize(TSS2_TCTI_CONTEXT **tcti, ESYS_CONTEXT **esys){
+    if (esys && *esys) {
+        Esys_Finalize(esys);
     }
-    if (tcti){
-        Tss2_TctiLdr_Finalize(&tcti);
-        free(tcti);
+    if (tcti && *tcti) {
+        Tss2_TctiLdr_Finalize(tcti);
     }
 }
 
-static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT *tcti, ESYS_CONTEXT *esys){
-    if (rc != TSS2_RC_SUCCESS){
+static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT **tcti, ESYS_CONTEXT **esys){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("Failed:0x%x\n", rc);
         printf("%s\n", Tss2_RC_Decode(rc));
         ctx_finalize(tcti, esys);
@@ -30,23 +32,21 @@ static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT *tcti, ESYS_CONTEXT *esys){
 //int test_quote(QuoteResult *result){
 int main(void){
     TSS2_RC rc;
-    static ESYS_CONTEXT *es_ctx = NULL;
-    static TSS2_TCTI_CONTEXT *t_ctx = NULL;
+    ESYS_CONTEXT *es_ctx = NULL;
+    TSS2_TCTI_CONTEXT *t_ctx = NULL;
     TSS2_ABI_VERSION *CURRENT = NULL;
 
     rc = Tss2_TctiLdr_Initialize(NULL, &t_ctx);
-    if (rc != TSS2_RC_SUCCESS){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("tctildr initialize failed\n");
-        free(es_ctx);
         return 1;
     }
     printf("tctildr initialize success\n");
 
     rc = Esys_Initialize(&es_ctx, t_ctx, CURRENT);
-    if (rc != TSS2_RC_SUCCESS){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("esys initialize failed:0x%x\n",rc);
-        free(t_ctx);
-        free(es_ctx);
+        ctx_finalize(&t_ctx, &es_ctx);
         return 1;
     }
 
@@ -117,7 +117,7 @@ int main(void){
             &primary_Hash,
             &primary_Ticket
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("Primary key created. Handle: 0x%x\n", primary_handle);
 
     TPM2B_PUBLIC ak_inPublic = {
@@ -146,7 +146,7 @@ int main(void){
             },
             .unique.rsa = {.size = 0},
         }
-    };	
+    };
 
 	TPM2B_PUBLIC *ak_pub = NULL;
     TPM2B_PRIVATE *ak_priv = NULL;
@@ -168,7 +168,7 @@ int main(void){
             &ak_Hash,
             &ak_Ticket
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("create ak OK\n");
 
     TPM2_HANDLE handle = ESYS_TR_NONE;
@@ -181,7 +181,7 @@ int main(void){
             ak_pub,
             &handle
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("load OK\n");
 
     TPM2B_DATA qualifyingData;
@@ -194,7 +194,7 @@ int main(void){
             qualifyingData.size,
             &nonce
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("nonce OK\n");
 
 	FILE *fp_nonce = fopen("../nonce.bin", "wb");
@@ -203,10 +203,33 @@ int main(void){
 
     memcpy(qualifyingData.buffer, nonce->buffer, qualifyingData.size);
 
-    TPML_DIGEST_VALUES ex_value;
+    /* PCR16へextendする値はSHA-256の32バイトダイジェストである必要があるが、
+     * nonceは20バイトしかない。不足分を未初期化のまま使うとextend結果が
+     * 実行のたびに変わってしまうため、nonceをTPMでSHA-256ハッシュしてから
+     * その32バイトのダイジェストをextendする。 */
+    TPM2B_MAX_BUFFER nonce_buf;
+    nonce_buf.size = nonce->size;
+    memcpy(nonce_buf.buffer, nonce->buffer, nonce->size);
+
+    TPM2B_DIGEST *nonce_digest = NULL;
+    TPMT_TK_HASHCHECK *nonce_validation = NULL;
+
+    rc = Esys_Hash(
+            es_ctx,
+            ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+            &nonce_buf,
+            TPM2_ALG_SHA256,
+            ESYS_TR_RH_NULL,
+            &nonce_digest,
+            &nonce_validation
+            );
+    rc_check(rc, &t_ctx, &es_ctx);
+    printf("nonce hash OK\n");
+
+    TPML_DIGEST_VALUES ex_value = {0};
     ex_value.count = 1;
-    ex_value.digests -> hashAlg = TPM2_ALG_SHA256;
-    memcpy(ex_value.digests -> digest.sha256, nonce->buffer, nonce->size);
+    ex_value.digests[0].hashAlg = TPM2_ALG_SHA256;
+    memcpy(ex_value.digests[0].digest.sha256, nonce_digest->buffer, nonce_digest->size);
 
     rc = Esys_PCR_Extend(
             es_ctx,
@@ -214,7 +237,7 @@ int main(void){
             ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
             &ex_value
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("extend OK\n");
 
     TPM2B_ATTEST *quote;
@@ -230,13 +253,16 @@ int main(void){
     pcrSelect[1] →   PCR 8 ～ 15
     pcrSelect[2] →   PCR 16 ～ 23
     */
-    TPML_PCR_SELECTION Select_PCR;
+    TPML_PCR_SELECTION Select_PCR = {0};
     Select_PCR.count = 1;
-    Select_PCR.pcrSelections -> hash = TPM2_ALG_SHA256;
-    Select_PCR.pcrSelections -> sizeofSelect = 3;
-    Select_PCR.pcrSelections -> pcrSelect[0] = 0x55;
-    Select_PCR.pcrSelections -> pcrSelect[1] = 0x00;
-    Select_PCR.pcrSelections -> pcrSelect[2] = 0x00;
+    Select_PCR.pcrSelections[0].hash = TPM2_ALG_SHA256;
+    Select_PCR.pcrSelections[0].sizeofSelect = 3;
+    Select_PCR.pcrSelections[0].pcrSelect[0] = 0x55;
+    Select_PCR.pcrSelections[0].pcrSelect[1] = 0x00;
+    /* PCR16(bit0)を選択に含める。直前でnonceのダイジェストをPCR16へ
+     * extendしているため、quoteの対象に含めないとfreshness確認の
+     * 意味がなくなってしまう。 */
+    Select_PCR.pcrSelections[0].pcrSelect[2] = 0x01;
 
     rc = Esys_Quote(
             es_ctx,
@@ -248,7 +274,7 @@ int main(void){
             &quote,
             &signature
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("quote OK\n");
 
 	size_t q_offset = 0;
@@ -287,10 +313,15 @@ int main(void){
     Esys_Free(ak_Data);
     Esys_Free(ak_Hash);
     Esys_Free(ak_Ticket);
+    Esys_Free(nonce);
+    Esys_Free(nonce_digest);
+    Esys_Free(nonce_validation);
+    Esys_Free(quote);
+    Esys_Free(signature);
 
     Esys_FlushContext(es_ctx, handle);
     Esys_FlushContext(es_ctx, primary_handle);
 
-    ctx_finalize(t_ctx, es_ctx);	
+    ctx_finalize(&t_ctx, &es_ctx);
     return 0;
 }

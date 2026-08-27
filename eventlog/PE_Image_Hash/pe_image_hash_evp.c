@@ -117,6 +117,14 @@ static int compute_pe_image_hash(const char *filepath, uint8_t out_hash[32]) {
     size_of_headers_offset = optional_header_offset + 60;
     size_of_headers = read_u32(data + size_of_headers_offset);
 
+    /* SizeOfHeadersがファイルサイズを超えている場合は壊れたPEファイル。
+     * 検証しないままハッシュ計算範囲の終端として使うとヒープ範囲外読み出しになる。 */
+    if ((long)size_of_headers > file_size) {
+        fprintf(stderr, "SizeOfHeadersがファイルサイズを超えています\n");
+        free(data);
+        return -1;
+    }
+
     /* NumberOfRvaAndSizes / DataDirectory の位置は形式により異なる */
     if (!is_pe32plus) {
         number_of_rva_and_sizes_offset = optional_header_offset + 92;

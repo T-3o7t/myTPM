@@ -45,19 +45,21 @@ static char *data_read(const char *path, size_t *out_size) {
     return buf;
 }
 
-static void context_finalize(TSS2_TCTI_CONTEXT *tcti, ESYS_CONTEXT *esys){
-    if(esys){
-        Esys_Finalize(&esys);
-        free(esys);
+/* tcti/esys は呼び出し元の変数そのもの(ダブルポインタ)を受け取り、
+ * Finalize後に呼び出し元のポインタもNULLへ戻す。値渡しだと
+ * ここでNULL化されるのはローカルコピーだけになり、呼び出し元には
+ * 解放済みポインタが残ってしまう(ダングリングポインタ)。 */
+static void context_finalize(TSS2_TCTI_CONTEXT **tcti, ESYS_CONTEXT **esys){
+    if (esys && *esys) {
+        Esys_Finalize(esys);
     }
-    if(tcti){
-        Tss2_TctiLdr_Finalize(&tcti);
-        free(tcti);
+    if (tcti && *tcti) {
+        Tss2_TctiLdr_Finalize(tcti);
     }
 }
 
-static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT *tcti, ESYS_CONTEXT *esys){
-    if(rc != TSS2_RC_SUCCESS){
+static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT **tcti, ESYS_CONTEXT **esys){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("Failed:0x%x\n", rc);
         printf("%s\n", Tss2_RC_Decode(rc));
         context_finalize(tcti, esys);
@@ -84,26 +86,24 @@ static void save_signature(const TPMT_SIGNATURE *sig, const char *path){
 int main(int argc, char *argv[]){
 
     TSS2_RC rc;
-    static ESYS_CONTEXT *es_ctx = NULL;
-    static TSS2_TCTI_CONTEXT *tcti = NULL;
+    ESYS_CONTEXT *es_ctx = NULL;
+    TSS2_TCTI_CONTEXT *tcti = NULL;
     TSS2_ABI_VERSION *CURRENT = NULL;
     ESYS_TR handle;
 
 
 
     rc = Tss2_TctiLdr_Initialize(NULL, &tcti);
-    if(rc != TSS2_RC_SUCCESS){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("tctildr initialize failed\n");
-        free(es_ctx);
         return 1;
     }
     printf("tctildr initialize success\n");
 
     rc = Esys_Initialize(&es_ctx, tcti, CURRENT);
-    if(rc != TSS2_RC_SUCCESS){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("esys initialize failed:0x%x\n",rc);
-        free(tcti);
-        free(es_ctx);
+        context_finalize(&tcti, &es_ctx);
         return 1;
     }
 
@@ -111,7 +111,7 @@ int main(int argc, char *argv[]){
 
     rc = Esys_TR_FromTPMPublic(
         es_ctx,
-        0x81010100,   
+        0x81010100,
         ESYS_TR_NONE,
         ESYS_TR_NONE,
         ESYS_TR_NONE,
@@ -143,9 +143,9 @@ int main(int argc, char *argv[]){
         &validation
     );
 
-    rc_check(rc, tcti, es_ctx);
+    rc_check(rc, &tcti, &es_ctx);
     printf("hash OK\n");
-    
+
     TPMT_SIG_SCHEME scheme = {
         .scheme = TPM2_ALG_RSASSA,
         .details.rsassa.hashAlg = TPM2_ALG_SHA256
@@ -163,7 +163,7 @@ int main(int argc, char *argv[]){
             &signature
             );
 
-    rc_check(rc, tcti, es_ctx);
+    rc_check(rc, &tcti, &es_ctx);
     printf("sign OK\n");
 
     save_signature(signature, "sig.bin");
@@ -178,13 +178,13 @@ int main(int argc, char *argv[]){
             signature,
             &valid
             );
-    rc_check(rc, tcti, es_ctx);
+    rc_check(rc, &tcti, &es_ctx);
     printf("verify OK\n");
 
-    TPML_DIGEST_VALUES ext_value;
+    TPML_DIGEST_VALUES ext_value = {0};
     ext_value.count = 1;
-    ext_value.digests -> hashAlg = TPM2_ALG_SHA256;
-    memcpy(ext_value.digests -> digest.sha256, digest->buffer, digest->size);
+    ext_value.digests[0].hashAlg = TPM2_ALG_SHA256;
+    memcpy(ext_value.digests[0].digest.sha256, digest->buffer, digest->size);
 
     rc = Esys_PCR_Extend(
             es_ctx,
@@ -192,7 +192,7 @@ int main(int argc, char *argv[]){
             ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
             &ext_value
             );
-    rc_check(rc, tcti, es_ctx);
+    rc_check(rc, &tcti, &es_ctx);
     printf("extend OK\n");
 
     TPM2B_DATA qualifyingData;
@@ -205,7 +205,7 @@ int main(int argc, char *argv[]){
             qualifyingData.size,
             &nonce
             );
-    rc_check(rc, tcti, es_ctx);
+    rc_check(rc, &tcti, &es_ctx);
     printf("nonce OK\n");
 
     memcpy(qualifyingData.buffer, nonce->buffer, qualifyingData.size);
@@ -218,13 +218,13 @@ int main(int argc, char *argv[]){
     pcrSelect[1] →  PCR 8 ～ 15
     pcrSelect[2] →  PCR 16 ～ 23
     */
-    TPML_PCR_SELECTION Select_PCR;
+    TPML_PCR_SELECTION Select_PCR = {0};
     Select_PCR.count = 1;
-    Select_PCR.pcrSelections -> hash = TPM2_ALG_SHA256;
-    Select_PCR.pcrSelections -> sizeofSelect = 3;
-    //Select_PCR.pcrSelections -> pcrSelect[0] = ;
-    Select_PCR.pcrSelections -> pcrSelect[1] = 1 << 2;
-    Select_PCR.pcrSelections -> pcrSelect[2] = 1;
+    Select_PCR.pcrSelections[0].hash = TPM2_ALG_SHA256;
+    Select_PCR.pcrSelections[0].sizeofSelect = 3;
+    Select_PCR.pcrSelections[0].pcrSelect[0] = 0;
+    Select_PCR.pcrSelections[0].pcrSelect[1] = 1 << 2;
+    Select_PCR.pcrSelections[0].pcrSelect[2] = 1;
 
     rc = Esys_Quote(
             es_ctx,
@@ -236,12 +236,20 @@ int main(int argc, char *argv[]){
             &quoted,
             &signature_quote
             );
-    rc_check(rc, tcti, es_ctx);
+    rc_check(rc, &tcti, &es_ctx);
     printf("quote OK\n");
 
     save_signature(signature_quote, "sig_quote.bin");
 
+    free(message);
+    Esys_Free(digest);
+    Esys_Free(validation);
+    Esys_Free(signature);
+    Esys_Free(valid);
+    Esys_Free(nonce);
+    Esys_Free(quoted);
+    Esys_Free(signature_quote);
+
+    context_finalize(&tcti, &es_ctx);
     return 0;
 }
-
-

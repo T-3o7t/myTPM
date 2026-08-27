@@ -57,18 +57,20 @@ static uint8_t *blob_load(char *file_name, size_t *size){
     return buffer;
 }
 
-static void ctx_finalize(TSS2_TCTI_CONTEXT *tcti, ESYS_CONTEXT *esys){
-    if (esys) {
-        Esys_Finalize(&esys);
-        free(esys);
+/* tcti/esys は呼び出し元の変数そのもの(ダブルポインタ)を受け取り、
+ * Finalize後に呼び出し元のポインタもNULLへ戻す。値渡しだと
+ * ここでNULL化されるのはローカルコピーだけになり、呼び出し元には
+ * 解放済みポインタが残ってしまう(ダングリングポインタ)。 */
+static void ctx_finalize(TSS2_TCTI_CONTEXT **tcti, ESYS_CONTEXT **esys){
+    if (esys && *esys) {
+        Esys_Finalize(esys);
     }
-    if (tcti) {
-        Tss2_TctiLdr_Finalize(&tcti);
-        free(tcti);
+    if (tcti && *tcti) {
+        Tss2_TctiLdr_Finalize(tcti);
     }
 }
 
-static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT *tcti, ESYS_CONTEXT *esys){
+static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT **tcti, ESYS_CONTEXT **esys){
     if (rc != TSS2_RC_SUCCESS) {
         printf("Failed:0x%x\n", rc);
         printf("%s\n", Tss2_RC_Decode(rc));
@@ -80,14 +82,13 @@ static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT *tcti, ESYS_CONTEXT *esys){
 //int test_quote(QuoteResult *result){
 int main(void){
     TSS2_RC rc;
-    static ESYS_CONTEXT *es_ctx = NULL;
-    static TSS2_TCTI_CONTEXT *t_ctx = NULL;
+    ESYS_CONTEXT *es_ctx = NULL;
+    TSS2_TCTI_CONTEXT *t_ctx = NULL;
     TSS2_ABI_VERSION *CURRENT = NULL;
 
     rc = Tss2_TctiLdr_Initialize(NULL, &t_ctx);
     if (rc != TSS2_RC_SUCCESS) {
         printf("tctildr initialize failed\n");
-        free(es_ctx);
         return 1;
     }
     printf("tctildr initialize success\n");
@@ -95,8 +96,7 @@ int main(void){
     rc = Esys_Initialize(&es_ctx, t_ctx, CURRENT);
     if (rc != TSS2_RC_SUCCESS) {
         printf("esys initialize failed:0x%x\n",rc);
-        free(t_ctx);
-        free(es_ctx);
+        ctx_finalize(&t_ctx, &es_ctx);
         return 1;
     }
 
@@ -167,7 +167,7 @@ int main(void){
             &primary_Hash,
             &primary_Ticket
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("Primary key created. Handle: 0x%x\n", primary_handle);
 
     TPM2B_PUBLIC ak_inPublic = {
@@ -196,7 +196,7 @@ int main(void){
             },
             .unique.rsa = {.size = 0},
         }
-    };	
+    };
 
 	TPM2B_PUBLIC *ak_pub = NULL;
     TPM2B_PRIVATE *ak_priv = NULL;
@@ -218,7 +218,7 @@ int main(void){
             &ak_Hash,
             &ak_Ticket
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("create ak OK\n");
 
     TPM2_HANDLE handle = ESYS_TR_NONE;
@@ -231,7 +231,7 @@ int main(void){
             ak_pub,
             &handle
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("load OK\n");
 /*
     uint8_t ak_pub_buf[1024];
@@ -243,9 +243,9 @@ int main(void){
             sizeof(ak_pub_buf),
             &ak_offset
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("Marshal OK\n");
-    printf("Marshal size = %zu\n", ak_offset);	
+    printf("Marshal size = %zu\n", ak_offset);
 */
 
     TPM2B_ATTEST *quote;
@@ -261,19 +261,30 @@ int main(void){
     pcrSelect[1] →   PCR 8 ～ 15
     pcrSelect[2] →   PCR 16 ～ 23
     */
-    TPML_PCR_SELECTION Select_PCR;
+    TPML_PCR_SELECTION Select_PCR = {0};
     Select_PCR.count = 1;
-    Select_PCR.pcrSelections -> hash = TPM2_ALG_SHA256;
-    Select_PCR.pcrSelections -> sizeofSelect = 3;
-    Select_PCR.pcrSelections -> pcrSelect[0] = 0x55;
-    Select_PCR.pcrSelections -> pcrSelect[1] = 0x00;
-    Select_PCR.pcrSelections -> pcrSelect[2] = 0x00;
+    Select_PCR.pcrSelections[0].hash = TPM2_ALG_SHA256;
+    Select_PCR.pcrSelections[0].sizeofSelect = 3;
+    Select_PCR.pcrSelections[0].pcrSelect[0] = 0x55;
+    Select_PCR.pcrSelections[0].pcrSelect[1] = 0x00;
+    /* quote_save側でPCR16にnonceのダイジェストをextendしているため、
+     * 検証側の選択にもPCR16(bit0)を含めておく(save側の選択と揃える)。 */
+    Select_PCR.pcrSelections[0].pcrSelect[2] = 0x01;
 
     TPM2B_DATA qualifyingData;
     qualifyingData.size = 20;
 	size_t nonce_size = qualifyingData.size;
 	unsigned char *nonce = data_read("../nonce.bin", &nonce_size);
-	memcpy(nonce, qualifyingData.buffer, nonce_size);
+	if (!nonce || nonce_size != qualifyingData.size) {
+		fprintf(stderr, "nonce.binの読み込みに失敗、またはサイズが不正です\n");
+		ctx_finalize(&t_ctx, &es_ctx);
+		return 1;
+	}
+	/* quote_save側が保存したnonceをqualifyingDataへコピーする。
+	 * (以前はコピー元/コピー先が逆で、未初期化のqualifyingData.bufferを
+	 *  読み出してnonceを上書きしてしまっていた) */
+	memcpy(qualifyingData.buffer, nonce, nonce_size);
+	free(nonce);
 
     rc = Esys_Quote(
             es_ctx,
@@ -285,7 +296,7 @@ int main(void){
             &quote,
             &signature
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("quote OK\n");
 
 	TPMS_ATTEST Digest;
@@ -296,7 +307,7 @@ int main(void){
 	size_t quote_loaded_offset = 0;
 	size_t quote_loaded_size;
 	uint8_t *quote_loaded_buffer = blob_load("../quote.bin", &quote_loaded_size);
-	
+
 	Tss2_MU_TPM2B_ATTEST_Unmarshal(quote_loaded_buffer, quote_loaded_size, &quote_loaded_offset, &quote_loaded);
 	printf("quote.size = %u\n", quote_loaded.size);
 /*
@@ -319,8 +330,18 @@ int main(void){
 
 	EVP_PKEY *pkey = NULL;
     bool ret = ak_load(&ak_pub_loaded, &pkey);
-    if (!ret)
-		return false;
+    if (!ret) {
+		fprintf(stderr, "ak_loadに失敗しました\n");
+		free(quote_loaded_buffer);
+		free(sig_loaded_buffer);
+		free(ak_loaded_buffer);
+		Esys_Free(quote);
+		Esys_Free(signature);
+		Esys_FlushContext(es_ctx, handle);
+		Esys_FlushContext(es_ctx, primary_handle);
+		ctx_finalize(&t_ctx, &es_ctx);
+		return 1;
+	}
 
 	unsigned char check_digest[32];
 	SHA256(quote_loaded.attestationData, quote_loaded.size, check_digest);
@@ -341,11 +362,17 @@ int main(void){
 	TPMS_ATTEST loaded_Digest;
 	size_t loaded_Digest_offset = 0;
 	Tss2_MU_TPMS_ATTEST_Unmarshal(quote_loaded.attestationData, quote_loaded.size, &loaded_Digest_offset, &loaded_Digest);
-	
+
 	if (memcmp(Digest.attested.quote.pcrDigest.buffer, loaded_Digest.attested.quote.pcrDigest.buffer, Digest.attested.quote.pcrDigest.size)==0)
 		printf("quote check OK\n");
 	else
 		printf("quote check failed\n");
+
+	free(quote_loaded_buffer);
+	free(sig_loaded_buffer);
+	free(ak_loaded_buffer);
+
+	EVP_PKEY_CTX_free(pkey_ctx);
 
 	Esys_Free(outPublic);
     Esys_Free(primary_Data);
@@ -356,12 +383,14 @@ int main(void){
     Esys_Free(ak_Data);
     Esys_Free(ak_Hash);
     Esys_Free(ak_Ticket);
+    Esys_Free(quote);
+    Esys_Free(signature);
 
     Esys_FlushContext(es_ctx, handle);
     Esys_FlushContext(es_ctx, primary_handle);
-	
+
 	EVP_PKEY_free(pkey);
 
-    ctx_finalize(t_ctx, es_ctx);	
+    ctx_finalize(&t_ctx, &es_ctx);
     return 0;
 }

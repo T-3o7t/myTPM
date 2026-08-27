@@ -6,43 +6,45 @@
 #include <tss2/tss2_mu.h>
 
 
-static void ctx_finalize(TSS2_TCTI_CONTEXT *tcti, ESYS_CONTEXT *esys){
-    if(esys){
-        Esys_Finalize(&esys);
-        free(esys);
+/* tcti/esys は呼び出し元の変数そのもの(ダブルポインタ)を受け取り、
+ * Finalize後に呼び出し元のポインタもNULLへ戻す。値渡しだと
+ * ここでNULL化されるのはローカルコピーだけになり、呼び出し元には
+ * 解放済みポインタが残ってしまう(ダングリングポインタ)。 */
+static void ctx_finalize(TSS2_TCTI_CONTEXT **tcti, ESYS_CONTEXT **esys){
+    if (esys && *esys) {
+        Esys_Finalize(esys);
     }
 
-    if(tcti){
-        Tss2_TctiLdr_Finalize(&tcti);
-        free(tcti);
+    if (tcti && *tcti) {
+        Tss2_TctiLdr_Finalize(tcti);
     }
 }
 
-static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT *tcti, ESYS_CONTEXT *esys){
-    if(rc != TSS2_RC_SUCCESS){
+static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT **tcti, ESYS_CONTEXT **esys){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("%s\n", Tss2_RC_Decode(rc));
-            ctx_finalize(tcti, esys);
-            exit(1);
+        ctx_finalize(tcti, esys);
+        exit(1);
     }
 }
 
 int main(void){
 
     TSS2_RC rc;
-    static ESYS_CONTEXT *es_ctx = NULL;
-    static TSS2_TCTI_CONTEXT *t_ctx = NULL;
+    ESYS_CONTEXT *es_ctx = NULL;
+    TSS2_TCTI_CONTEXT *t_ctx = NULL;
 
     rc = Tss2_TctiLdr_Initialize(NULL, &t_ctx);
-    if(rc != TSS2_RC_SUCCESS){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("tctildr initialize failed\n");
-        free(es_ctx);
         return 1;
     }
     printf("tctildr initialize success\n");
 
     rc = Esys_Initialize(&es_ctx, t_ctx, NULL);
-    if(rc != TSS2_RC_SUCCESS){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("esys initialize failed:0x%x\n",rc);
+        ctx_finalize(&t_ctx, &es_ctx);
         return 1;
     }
     printf("esys initialize success\n");
@@ -97,7 +99,7 @@ int main(void){
     TPM2B_CREATION_DATA *primary_Data = NULL;
     TPM2B_DIGEST *primary_Hash = NULL;
     TPMT_TK_CREATION *primary_Ticket = NULL;
-    
+
     rc = Esys_CreatePrimary(
             es_ctx,
             ESYS_TR_RH_OWNER,
@@ -112,7 +114,7 @@ int main(void){
             &primary_Hash,
             &primary_Ticket
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("Primary key created. Handle: 0x%x\n", primary_handle);
 
     TPM2B_PUBLIC ak_inPublic = {
@@ -163,7 +165,7 @@ int main(void){
             &ak_Hash,
             &ak_Ticket
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("create ak OK\n");
 
     TPM2_HANDLE load_handle = ESYS_TR_NONE;
@@ -176,9 +178,9 @@ int main(void){
             ak_pub,
             &load_handle
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("load OK\n");
-    
+
     uint8_t ak_pub_buf[1024];
     size_t ak_offset = 0;
 
@@ -188,7 +190,7 @@ int main(void){
             sizeof(ak_pub_buf),
             &ak_offset
             );
-    rc_check(rc, t_ctx, es_ctx);
+    rc_check(rc, &t_ctx, &es_ctx);
     printf("Marshal OK\n");
     printf("Marshal size = %zu\n", ak_offset);
 
@@ -205,6 +207,6 @@ int main(void){
     Esys_FlushContext(es_ctx, load_handle);
     Esys_FlushContext(es_ctx, primary_handle);
 
-    ctx_finalize(t_ctx, es_ctx);
+    ctx_finalize(&t_ctx, &es_ctx);
     return 0;
 }

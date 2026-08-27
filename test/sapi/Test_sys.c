@@ -45,19 +45,23 @@ static unsigned char *data_read(const char *path, size_t *out_size) {
     return buf;
 }
 
-static void context_finalize(TSS2_TCTI_CONTEXT *tcti, TSS2_SYS_CONTEXT *sys){
-    if(sys){
-        Tss2_Sys_Finalize(sys);
-        free(sys);
+/* tcti/sys は呼び出し元の変数そのもの(ダブルポインタ)を受け取り、
+ * Finalize後に呼び出し元のポインタもNULLへ戻す。値渡しだと
+ * ここでNULL化されるのはローカルコピーだけになり、呼び出し元には
+ * 解放済みポインタが残ってしまう(ダングリングポインタ)。 */
+static void context_finalize(TSS2_TCTI_CONTEXT **tcti, TSS2_SYS_CONTEXT **sys){
+    if (sys && *sys) {
+        Tss2_Sys_Finalize(*sys);
+        free(*sys);
+        *sys = NULL;
     }
-    if(tcti){
-        Tss2_TctiLdr_Finalize(&tcti);
-        free(tcti);
+    if (tcti && *tcti) {
+        Tss2_TctiLdr_Finalize(tcti);
     }
 }
 
-static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT *tcti, TSS2_SYS_CONTEXT *sys){
-    if(rc != TSS2_RC_SUCCESS){
+static void rc_check(TSS2_RC rc, TSS2_TCTI_CONTEXT **tcti, TSS2_SYS_CONTEXT **sys){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("Failed:0x%x\n", rc);
         printf("%s\n", Tss2_RC_Decode(rc));
         context_finalize(tcti, sys);
@@ -85,18 +89,17 @@ int main(int argc, char *argv[]){
 
     TSS2_RC rc;
     size_t size;
-    static TSS2_SYS_CONTEXT *s_ctx = NULL;
-    static TSS2_TCTI_CONTEXT *tcti = NULL;
+    TSS2_SYS_CONTEXT *s_ctx = NULL;
+    TSS2_TCTI_CONTEXT *tcti = NULL;
     TSS2_ABI_VERSION *CURRENT = NULL;
     const TPMI_DH_OBJECT hmac_handle = 0x81010001;
     const TPMI_DH_OBJECT sign_handle = 0x81010010;
 
-    //tcti = (TSS2_TCTI_CONTEXT*)calloc(1,size); 
+    //tcti = (TSS2_TCTI_CONTEXT*)calloc(1,size);
 
     rc = Tss2_TctiLdr_Initialize(NULL, &tcti);
-    if(rc != TSS2_RC_SUCCESS){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("tctildr initialize failed\n");
-        free(s_ctx);
         return 1;
     }
     printf("tctildr initialize success\n");
@@ -106,15 +109,14 @@ int main(int argc, char *argv[]){
     s_ctx = (TSS2_SYS_CONTEXT*)calloc(1, size);
 
     rc = Tss2_Sys_Initialize(s_ctx, size, tcti, CURRENT);
-    if(rc != TSS2_RC_SUCCESS){
+    if (rc != TSS2_RC_SUCCESS) {
         printf("sys initialize failed:0x%x\n",rc);
-        free(tcti);
-        free(s_ctx);
+        context_finalize(&tcti, &s_ctx);
         return 1;
     }
 
     printf("Initialize success\n");
-    
+
     size_t data_size;
     const char *message = data_read(argv[1], &data_size);
     if(!message){
@@ -129,16 +131,16 @@ int main(int argc, char *argv[]){
     TPMT_TK_HASHCHECK validation;
 
     rc = Tss2_Sys_Hash(
-            s_ctx, 
-            NULL, 
-            &data, 
+            s_ctx,
+            NULL,
+            &data,
             TPM2_ALG_SHA256,
             TPM2_RH_NULL,
             &hash,
             &validation,
             NULL
             );
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("hash success\n");
 
     size_t data_dummy_size;
@@ -163,14 +165,14 @@ int main(int argc, char *argv[]){
             &hash_Dummy,
             &validation_dummy,
             NULL);
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("dummy hash success\n");
 /*
     printf("Hash(%u bytes): ", outHash.size);
     for(UINT16 i = 0; i < outHash.size; i++)
         printf("%02x", outHash.buffer[i]);
     printf("\n");
-*/ 
+*/
     TPMI_SH_AUTH_SESSION session_handle = TPM2_RH_NULL;
     //Tss2_Sys_SetCmdAuths(s_ctx, &CmdAuth);
     TSS2L_SYS_AUTH_RESPONSE rspAuth = {0};
@@ -178,7 +180,7 @@ int main(int argc, char *argv[]){
     TPM2B_NONCE nonceTPM = {0};
     nonceCaller.size = 20;
     memset(nonceCaller.buffer, 0, nonceCaller.size);
-    
+
     TPMT_SYM_DEF symmetric = {0};
     symmetric.algorithm = TPM2_ALG_NULL;
 
@@ -195,7 +197,7 @@ int main(int argc, char *argv[]){
             &session_handle,
             &nonceTPM,
             &rspAuth);
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("Authsession succsess\n");
 
     TSS2L_SYS_AUTH_COMMAND CmdAuth;
@@ -214,7 +216,7 @@ int main(int argc, char *argv[]){
             TPM2_ALG_SHA256,
             &outHMAC,
             &rspAuth);
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("HMAC success\n");
 
     TPMT_SIG_SCHEME scheme = {
@@ -238,7 +240,7 @@ int main(int argc, char *argv[]){
             TPM2_ALG_SHA256,
             &outHMAC,
             &rspAuth);
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("dummy HMAC success\n");
     if(memcmp(outHMAC.buffer, outHMAC_dummy.buffer, outHMAC.size) == 0)printf("valid\n");
     else{
@@ -263,7 +265,7 @@ int main(int argc, char *argv[]){
             &validation,
             &signature,
             &rspAuth);
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("sign success\n");
 /*  //signaturecheck
     if(!signature.signature.rsassa.sig.size)
@@ -285,7 +287,7 @@ int main(int argc, char *argv[]){
             &signature,
             &validation_verify,
             &rspAuth);
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("hash signature verify success\n");
 /*
     rc = Tss2_Sys_VerifySignature(
@@ -297,7 +299,7 @@ int main(int argc, char *argv[]){
             &signature,
             &validation_verify,
             &rspAuth);
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     //printf("%s\n", Tss2_RC_Decode(rc));
 */
 
@@ -305,10 +307,10 @@ int main(int argc, char *argv[]){
     CmdAuth_quote.count = 1;
     CmdAuth_quote.auths -> sessionHandle = TPM2_RS_PW;
 
-    TPML_DIGEST_VALUES ext_value;
+    TPML_DIGEST_VALUES ext_value = {0};
     ext_value.count = 1;
-    ext_value.digests -> hashAlg = TPM2_ALG_SHA256;
-    memcpy(ext_value.digests -> digest.sha256, outHMAC.buffer, outHMAC.size);
+    ext_value.digests[0].hashAlg = TPM2_ALG_SHA256;
+    memcpy(ext_value.digests[0].digest.sha256, outHMAC.buffer, outHMAC.size);
 
     rc = Tss2_Sys_PCR_Extend(
             s_ctx,
@@ -317,7 +319,7 @@ int main(int argc, char *argv[]){
             &ext_value,
             &rspAuth
             );
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("extend success\n");
 
     TPM2B_DATA qualifyingData;
@@ -331,7 +333,7 @@ int main(int argc, char *argv[]){
 		    &nonce,
 		    &rspAuth
 		    );
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("getrandom success\n");
 
     memcpy(qualifyingData.buffer, nonce.buffer, qualifyingData.size);
@@ -345,13 +347,13 @@ int main(int argc, char *argv[]){
 	pcrSelect[1] → PCR 8 ～ 15
 	pcrSelect[2] → PCR 16 ～ 23
 	*/
-    TPML_PCR_SELECTION Select_PCR;
+    TPML_PCR_SELECTION Select_PCR = {0};
     Select_PCR.count = 1;
-    Select_PCR.pcrSelections -> hash = TPM2_ALG_SHA256;
-    Select_PCR.pcrSelections -> sizeofSelect = 3;
-	//Select_PCR.pcrSelections -> pcrSelect[0] = ;
-	//Select_PCR.pcrSelections -> pcrSelect[1] = ;
-    Select_PCR.pcrSelections -> pcrSelect[2] = 1;
+    Select_PCR.pcrSelections[0].hash = TPM2_ALG_SHA256;
+    Select_PCR.pcrSelections[0].sizeofSelect = 3;
+    Select_PCR.pcrSelections[0].pcrSelect[0] = 0;
+    Select_PCR.pcrSelections[0].pcrSelect[1] = 0;
+    Select_PCR.pcrSelections[0].pcrSelect[2] = 1;
 
     rc = Tss2_Sys_Quote(
             s_ctx,
@@ -364,9 +366,9 @@ int main(int argc, char *argv[]){
             &signature_quote,
             &rspAuth
             );
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("quote success\n");
-  
+
     TPM2B_MAX_BUFFER data_quote;
     data_quote.size = quoted.size;
     memcpy(data_quote.buffer, quoted.attestationData, data_quote.size);
@@ -386,7 +388,7 @@ int main(int argc, char *argv[]){
             &validation_quote,
             NULL
 	    );
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("quote hash success\n");
 
     rc = Tss2_Sys_VerifySignature(
@@ -398,9 +400,9 @@ int main(int argc, char *argv[]){
 		    &validation_verify_quote,
 		    &rspAuth
 		    );
-    rc_check(rc, tcti, s_ctx);
+    rc_check(rc, &tcti, &s_ctx);
     printf("quote verify success\n");
 
-    context_finalize(tcti, s_ctx);
+    context_finalize(&tcti, &s_ctx);
     return 0;
 }
